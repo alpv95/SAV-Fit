@@ -6,13 +6,74 @@ from scipy.optimize import minimize
 from scipy.optimize import lsq_linear
 import pandas as pd
 import os
+import sys
 from scipy import stats
 import json
-
+import io
 from numpy import pi, cos 
+from pymultinest.solve import solve
 from pymultinest.run import run
 from pymultinest import Analyzer
 import pymultinest
+import contextlib
+import corner
+import osqp
+import scipy as sp
+from scipy import sparse
+import argparse
+
+parser = argparse.ArgumentParser()
+# parser.add_argument('--ensemble', action='store_true',
+#                     help='Ensemble prediction or single prediction')
+parser.add_argument('datafile', type=str,
+                    help='Folder to save chains/plots in')
+parser.add_argument('idx', type=int, default=2,
+                    help='Which Blazar to fit.')
+parser.add_argument('helicity', type=int, default=1, choices=[1, -1],
+                    help='Helicity of the helix.')
+parser.add_argument('delta', nargs=3, type=float, default=(1,0.001,0.001),
+                    help='weightings for PA, P and Pi respectively in loss function')
+parser.add_argument('--ratio_range', type=float, default=1,
+                    help='Effectively opening angle of the jet.')
+parser.add_argument('--resume', action='store_true', default=None, 
+                    help='Whether to resume from a different run')
+args = parser.parse_args()
+
+@contextlib.contextmanager
+def nostdout():
+    save_stdout = sys.stdout
+    sys.stdout = io.BytesIO()
+    yield
+    sys.stdout = save_stdout
+
+def QPsolver(data, prediction, lower, upper, bound_vals):
+    Flux, Flux_err = data
+
+    m = len(Flux); n = 2 #dimensions
+    w = np.diag(1 / Flux_err)
+    Ad = np.matmul(w, np.concatenate([np.array([[p, 1]]) for p in prediction], axis=0))
+    Ad = sparse.csc_matrix(Ad)
+    b = np.matmul(w, Flux)
+    constraint_M = np.array([[bound_vals[0], 1],[bound_vals[1], 1], [1, 0], [0, 1]]) #constrain_M * x < u etc.
+
+    # OSQP data
+    P = sparse.block_diag([sparse.csc_matrix((n, n)), sparse.eye(m)], format='csc')
+    Q = np.zeros(n + m)
+    A = sparse.vstack([
+        sparse.hstack([Ad, -sparse.eye(m)]),
+        sparse.hstack([sparse.csc_matrix(constraint_M), sparse.csc_matrix((n+2, m))])], format='csc')
+    l = np.hstack([b, lower, lower, 1e-8, -bound_vals[2]])
+    u = np.hstack([b, upper, upper, np.inf, bound_vals[2]])
+
+    with nostdout():
+        # Create an OSQP object
+        prob = osqp.OSQP()
+        # Setup workspace
+        prob.setup(P, Q, A, l, u, eps_rel=0.0001,polish=1)
+        # Solve problem
+        res = prob.solve()
+
+    return res.x[:2], res.info.obj_val #flux_scale and loss
 
 def Rot(phi): 
     return np.array([[math.cos(phi),0,math.sin(phi)],[0,1,0],[-math.sin(phi),0,math.cos(phi)]])
@@ -49,7 +110,7 @@ def rotate(th, B, axis): #about arbitrary axis
     + (-axis[:,:,1]*B[:,:,0] + axis[:,:,0]*B[:,:,1]) * np.sin(th)
     return np.stack([B1,B2,B3],axis=2)
 
-def Jet(day, ratio, ratio_range, pitch, offset, deg, axis=0, sign=-1, alpha=2, Gamma=10):
+def Jet(day, ratio, ratio_range, pitch, offset, deg, axis=0, sign=1, alpha=2, Gamma=10):
     """Helical jet of jets
     
     Args:
@@ -103,135 +164,186 @@ def Jet(day, ratio, ratio_range, pitch, offset, deg, axis=0, sign=-1, alpha=2, G
     
     return Pi, PA, P
 
+def main(datafile, delta, resume, data_idx, helicity, RR):
+    blazars = ['RBPLJ01364751.dat',
+    'RBPLJ08542006.dat',
+    'RBPLJ10487143.dat',
+    'RBPLJ15585625.dat',
+    'RBPLJ17510939_1.dat',
+    'RBPLJ17510939_2.dat',
+    'RBPLJ18066949.dat',
+    'RBPLJ18092041.dat',
+    'RBPLJ22321143.dat',
+    'RBPLJ23113425.dat']
+    blazar_data = []
+    for blazar in blazars:
+        blazar_data.append(np.loadtxt("/home/groups/rwr/alpv95/SAVRot/data/" + blazar))
 
-blazars = ['RBPLJ01364751.dat',
- 'RBPLJ08542006.dat',
- 'RBPLJ10487143.dat',
- 'RBPLJ15585625.dat',
- 'RBPLJ17510939_1.dat',
- 'RBPLJ17510939_2.dat',
- 'RBPLJ18066949.dat',
- 'RBPLJ18092041.dat',
- 'RBPLJ22321143.dat',
- 'RBPLJ23113425.dat']
-data = []
-for blazar in blazars:
-    data.append(np.loadtxt("/home/groups/rwr/alpv95/Rotations/data/" + blazar))
+    measured = pd.read_csv("/home/groups/rwr/alpv95/SAVRot/data/sample.txt")
 
-measured = pd.read_csv("/home/groups/rwr/alpv95/Rotations/data/sample.txt")
-
-
-
-delta = 1.0
-delta1 = 0.001
-delta2 = 0.001
-
-datum = data[2]
-Day = datum[:,0]
-Flux = datum[:,5]; Flux_err = datum[:,6]
-PA = datum[:,3]; PA_err = datum[:,4]
-Pi = datum[:,1] / 100; Pi_err = datum[:,2] / 100
-deg = abs(max(PA) - min(PA)) / abs(max(Day) - min(Day))
-
-# model for 2 gaussians, same width, fixed offset
-def model(pos1, width, height1, height2):
-	pos2 = pos1 + 0.05
-	return  height1 * stats.norm.pdf(x, pos1, width) + \
-		height2 * stats.norm.pdf(x, pos2, width)
-
-# a more elaborate prior
-# parameters are pos1, width, height1, [height2]
-def prior(cube, ndim, nparams):
-    #ratio, ratio_range, pitch, offset, sign, deg = X
-    cube[0] *= 2 #ratio
-    cube[2] = cube[2]*8 - 4 #pitch
-    cube[3] = cube[3]*360 - 180 #offset
-    cube[4] = cube[4] * (-deg*0.9 + deg*1.1) + deg*0.9 #deg
-    cube[5] = cube[5] * 180 #axis
-    cube[6] = 10**(cube[6]*2 - 7)  #flux_scale
-    cube[7] = cube[7] * 200 - 100 #flux_offset
-    cube[8] = cube[8] * 0.7 #pi_offset
-    return cube
-
-
-def loglike(cube, ndim, nparams):
-    ratio, ratio_range, pitch, offset, deg, axis, flux_scale, flux_offset, pi_offset = cube[0], cube[1], cube[2], cube[3], cube[4], cube[5], cube[6], cube[7], cube[8]
-    pi_hat, pa_hat, p_hat = Jet(Day, ratio, ratio_range, pitch, offset, deg=deg, axis=axis, sign=-1, alpha=2, Gamma=10)
+    try: os.mkdir(datafile)
+    except OSError: pass
+    datafile = datafile + "/3-"
     
-    loss_pa = np.sum( (np.cos(2*np.deg2rad(PA)) - np.cos(2*np.deg2rad(pa_hat)))**2 / PA_err**2
-                      + (np.sin(2*np.deg2rad(PA)) - np.sin(2*np.deg2rad(pa_hat)))**2 / PA_err**2 )
-    loss_flux = np.sum( (Flux - (p_hat * flux_scale + flux_offset) )**2 / Flux_err**2 )
-    loss_pi = np.sum((Pi - (pi_hat - pi_offset) )**2 / Pi_err**2)
-    return -(delta * loss_pa + delta1 * loss_flux + delta2 * loss_pi) 
 
-def prior_lsq(cube, ndim, nparams):
-    #ratio, ratio_range, pitch, offset, sign, deg = X
-    cube[0] *= 2 #ratio
-    cube[2] = cube[2]*8 - 4 #pitch
-    cube[3] = cube[3]*360 - 180 #offset
-    cube[4] = cube[4] * (-deg*0.85 + deg*1.15) + deg*0.85 #deg
-    return cube
+    N = len(blazars)
+    plt.figure(1, figsize=(13,4*N))
+    for i,blazar in enumerate(blazars):
+        helicity_result = [None,None]
+        datum = blazar_data[i]
+        Day = datum[:,0]
+        Flux = datum[:,5]; Flux_err = datum[:,6]
+        PA = datum[:,3]; PA_err = datum[:,4]
+        Pi = datum[:,1] / 100; Pi_err = datum[:,2] / 100
+        deg = abs(max(PA) - min(PA)) / abs(max(Day) - min(Day))
+        for j,helicity in enumerate([1,-1]):
 
-def loglike_lsq(cube, ndim, nparams):
-    ratio, ratio_range, pitch, offset, deg = cube[0],cube[1],cube[2],cube[3],cube[4]
-    pi_hat, pa_hat, p_hat = Jet(Day, ratio, ratio_range, pitch, offset, deg=deg, sign=-1, alpha=2, Gamma=10)
-    #Do linear regression to find optimal axis value here
-    b = np.ndarray.flatten(np.array([(np.cos(2*np.deg2rad(pa)),np.sin(2*np.deg2rad(pa))) for pa in PA]))
-    A = np.concatenate([np.array([[np.cos(2*np.deg2rad(pa)),-np.sin(2*np.deg2rad(pa))],
-                        [np.sin(2*np.deg2rad(pa)),np.cos(2*np.deg2rad(pa))]]) for pa in pa_hat],axis=0)
-    
-    w = np.ndarray.flatten(np.array([(err*2*np.sin(2*np.deg2rad(pa)),err*2*np.cos(2*np.deg2rad(pa))) for pa, err in zip(PA,PA_err)]))
-    w = np.diag(1 / w) #weighted least squares
-    x, loss_pa, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
-    axis = np.arctan2(x[1],x[0]) / 2
-    #Y = (ratio, ratio_range, pitch, offset, sign, np.rad2deg(axis))
- 
-    A = np.concatenate([np.array([[p,1]]) for p in p_hat],axis=0)
-    w = np.diag(1 / Flux_err)
-    b = Flux
-    flux_scale, loss_flux, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
-    
-    A = np.concatenate([np.array([[pi,1]]) for pi in pi_hat],axis=0)
-    w = np.diag(1 / Pi_err)
-    b = Pi
-    res = lsq_linear(np.matmul(w,A), np.matmul(w,b), bounds=[(0.99,-np.inf),(1.01, np.inf)])
-    pi_offset = res['x'][1]
-    loss_pi = 2 * res['cost']
-    
-    #Y = (ratio, ratio_range, pitch, offset, sign, deg, np.rad2deg(axis), flux_scale, pi_offset)
-    
-    return -(delta * loss_pa[0] + delta1 * loss_flux + delta2 * loss_pi)
+            def prior(cube, ndim, nparams):
+                #ratio, ratio_range, pitch, offset, sign, deg = X
+                cube[0] *= 2 #ratio
+                #ratio range just between 0 - 1
+                cube[1] *= RR
+                cube[2] = cube[2]*8 - 4 #pitch
+                cube[3] = cube[3]*360 - 180 #offset
+                cube[4] = cube[4] * (-deg*0.8 + deg*1.2) + deg*0.8 #deg
+                return cube
+            
+            def loglike(cube, ndim, nparams):
+                ratio, ratio_range, pitch, offset, deg = cube[0],cube[1],cube[2],cube[3],cube[4]
+                pi_hat, pa_hat, p_hat = Jet(Day, ratio, ratio_range, pitch, offset, deg=deg, sign=helicity, alpha=2, Gamma=10)
+                #Do linear regression to find optimal axis value here
+                b = np.ndarray.flatten(np.array([(np.cos(2*np.deg2rad(pa)),np.sin(2*np.deg2rad(pa))) for pa in PA]))
+                A = np.concatenate([np.array([[np.cos(2*np.deg2rad(pa)),-np.sin(2*np.deg2rad(pa))],
+                                    [np.sin(2*np.deg2rad(pa)),np.cos(2*np.deg2rad(pa))]]) for pa in pa_hat],axis=0)
+                
+                w = np.ndarray.flatten(np.array([(err*2*np.sin(2*np.deg2rad(pa)),err*2*np.cos(2*np.deg2rad(pa))) for pa, err in zip(PA,PA_err)]))
+                w = np.diag(1 / w) #weighted least squares
+                _, loss_pa, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))        
+                #_, loss_flux = QPsolver((Flux, Flux_err), p_hat, 0, np.inf, bound_vals=(np.max(p_hat),np.min(p_hat),np.inf) )
+                A = np.concatenate([np.array([[p,1]]) for p in p_hat],axis=0)
+                w = np.diag(1 / Flux_err)
+                b = Flux
+                _, loss_flux, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
 
+                #A = np.concatenate([np.array([[pi,1]]) for pi in pi_hat],axis=0)
+                A = np.array([pi_hat])
+                w = np.diag(1 / Pi_err)
+                b = Pi
+                _, loss_pi, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
+                #_, loss_pi = QPsolver((Pi, Pi_err), pi_hat, 0, 0.72, bound_vals=(np.max(pi_hat),np.min(pi_hat),0.05) )
+                        
+                return -(delta[0] * loss_pa[0] + delta[1] * loss_flux + delta[2] * loss_pi)
+        
 
-# analyse the file given as first argument
-try: os.mkdir('chains')
-except OSError: pass
+            # number of dimensions our problem has
+            #parameters = ["ratio", "ratio_range", "pitch", "offset", "deg", "axis", "flux_scale", "flux_offset", "pi_offset"]
+            parameters = ["ratio", "ratio_range", "pitch", "offset", "deg"]
+            n_params = len(parameters)
+            
+            # run MultiNest
+            pymultinest.run(loglike, prior, n_params, outputfiles_basename=datafile + '_1_'+ str(helicity) + blazar.replace(".dat",""), resume = resume, verbose = True, 
+                            const_efficiency_mode=True, n_live_points=1800, evidence_tolerance=0.5, sampling_efficiency=0.97,)
+            json.dump(parameters, open(datafile + '_1_params.json', 'w')) # save parameter names
+            
+            a = pymultinest.Analyzer(outputfiles_basename=datafile + '_1_'+ str(helicity) + blazar.replace(".dat",""), n_params = n_params)
+            print(a.get_best_fit())
+            helicity_result[j] = a.get_best_fit()['log_likelihood']
 
-datafile = "chains/3-"
+        if helicity_result[0] > helicity_result[1]:
+            helicity = 1
+            a = pymultinest.Analyzer(outputfiles_basename=datafile + '_1_'+ str(helicity) + blazar.replace(".dat",""), n_params = n_params)
+            
+        '''---------------- Print Parameters and their associated errors ------------------ '''
+        s = a.get_stats()
+        print('  marginal likelihood:')
+        print('    ln Z = %.1f +- %.1f' % (s['global evidence'], s['global evidence error']))
+        print('  parameters:')
+        for p, m in zip(parameters, s['marginals']):
+            lo, hi = m['1sigma']
+            med = m['median']
+            sigma = (hi - lo) / 2
+            if sigma == 0:
+                    idx = 3
+            else:
+                    idx = max(0, int(-np.floor(np.log10(sigma))) + 1)
+            fmt = '%%.%df' % idx
+            fmts = '\t'.join(['    %-15s' + fmt + " +- " + fmt])
+            print(fmts % (p, med, sigma))
+        
+        '''----------------  Corner Plot  ------------------ '''
+        print('creating marginal plot ...')
+        data = a.get_data()[:,2:]
+        weights = a.get_data()[:,0]
+        #mask = weights.cumsum() > 1e-5
+        for thresh in [1e-4,7e-5,4e-5,1e-5,1e-6]:
+            try:
+                mask = weights > thresh
+                corner.corner(data[mask,:], weights=weights[mask],
+                    labels=parameters, show_titles=True, title_fmt=".2f",)
+                break
+            except:
+                continue
+        plt.savefig(datafile + 'CORNER' + str(helicity) + '_' + blazar.replace(".dat","") + '.pdf', format="pdf")
+        plt.close()
+        
+        '''----------------  Posterior Fit Plot  ------------------ '''
+        ### Define offsets for plotting purposes:
+        print('creating fit plot ...')
+        plt.figure(1)
+        for x0 in a.get_equal_weighted_posterior()[::5000, :-1]:
+            x = np.linspace(Day[0],Day[-1],100)
+            pi_hat, pa_hat, p_hat = Jet(Day, x0[0], x0[1], pitch=x0[2], offset=x0[3], deg=x0[4], sign=helicity, alpha=2, Gamma=10)
+            
+            b = np.ndarray.flatten(np.array([(np.cos(2*np.deg2rad(pa)),np.sin(2*np.deg2rad(pa))) for pa in PA]))
+            A = np.concatenate([np.array([[np.cos(2*np.deg2rad(pa)),-np.sin(2*np.deg2rad(pa))],
+                                [np.sin(2*np.deg2rad(pa)),np.cos(2*np.deg2rad(pa))]]) for pa in pa_hat],axis=0)     
+            w = np.ndarray.flatten(np.array([(err*2*np.sin(2*np.deg2rad(pa)),err*2*np.cos(2*np.deg2rad(pa))) for pa, err in zip(PA,PA_err)]))
+            w = np.diag(1 / w) #weighted least squares
+            X, loss_pa, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
+            axis = np.arctan2(X[1],X[0]) / 2
+            
+            # flux_scale, _ = QPsolver((Flux, Flux_err), p_hat, 0, np.inf, bound_vals=(np.max(p_hat),np.min(p_hat),np.inf) )    
+            # pi_scale, _ = QPsolver((Pi, Pi_err), pi_hat, 0, 0.72, bound_vals=(np.max(pi_hat),np.min(pi_hat),0.05) )
+            A = np.concatenate([np.array([[p,1]]) for p in p_hat],axis=0)
+            w = np.diag(1 / Flux_err)
+            b = Flux
+            flux_scale, _, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
 
-# analyse with 1 gaussian
+            A = np.concatenate([np.array([[pi,1]]) for pi in pi_hat],axis=0)
+            w = np.diag(1 / Pi_err)
+            b = Pi
+            pi_scale, _, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
+            
+            
+            pi_hat, pa_hat, p_hat = Jet(x, x0[0], x0[1], pitch=x0[2], offset=x0[3], deg=x0[4], sign=helicity, axis=np.rad2deg(axis), alpha=2, Gamma=10)
+            
+            plt.subplot(N, 3, 3*i+1 ) 
+            plt.title(blazars[i].replace(".dat",""))
+            plt.ylabel(r"$\Pi$")
+            plt.plot(x,pi_hat * pi_scale[0],'b',alpha=0.3)
+            plt.errorbar(Day,Pi,yerr=Pi_err,c='r',fmt='o')
+            
+            plt.subplot(N,3, 3*i+2)
+            plt.ylabel(r"$\theta_{PA}$")
+            plt.title("Axis: {:.2f}".format(axis))
+            plt.plot(x,pa_hat,'b',alpha=0.3)
+            plt.plot(x,pa_hat-180,'b',alpha=0.3)
+            plt.plot(x,pa_hat+180,'b',alpha=0.3)
+            plt.plot(x,pa_hat-360,'b',alpha=0.3)
+            plt.plot(x,pa_hat+360,'b',alpha=0.3)
+            # plt.plot(x,pa_hat-540,'b',alpha=0.3)
+            # plt.plot(x,pa_hat+540,'b',alpha=0.3)
+            plt.ylim(min(PA) - 20, max(PA) + 20)
+            plt.errorbar(Day,PA,yerr=PA_err,c='r',fmt='o')
+            
+            plt.subplot(N,3, 3*i+3)
+            plt.ylabel(r"$Flux$")
+            plt.title(r"$\Gamma\theta$: {:.2f}".format(a.get_best_fit()['parameters'][0]))
+            plt.plot(x, p_hat * flux_scale[0] + flux_scale[1],'b',alpha=0.3)
+            plt.errorbar(Day,Flux,yerr=Flux_err,c='r',fmt='o')
+        
+    plt.savefig(datafile + 'FIT_all' + '.pdf', format="pdf")
+    plt.close()
 
-# number of dimensions our problem has
-#parameters = ["ratio", "ratio_range", "pitch", "offset", "deg", "axis", "flux_scale", "flux_offset", "pi_offset"]
-parameters = ["ratio", "ratio_range", "pitch", "offset", "deg"]
-n_params = len(parameters)
-
-
-# run MultiNest
-pymultinest.run(loglike_lsq, prior_lsq, n_params, outputfiles_basename=datafile + '_1_', resume = False, verbose = True, 
-                const_efficiency_mode=True, n_live_points=1400, evidence_tolerance=0.5, sampling_efficiency=0.95,)
-json.dump(parameters, open(datafile + '_1_params.json', 'w')) # save parameter names
-
-#with open('%sparams.json' % datafile, 'w') as f:
-    #json.dump(parameters, f, indent=2)
-
-# plot the distribution of a posteriori possible models
-#plt.figure() 
-#plt.plot(x, ydata, '+ ', color='red', label='data')
-a = pymultinest.Analyzer(outputfiles_basename=datafile + '_1_', n_params = n_params)
-# for (pos1, width, height1) in a.get_equal_weighted_posterior()[::100,:-1]:
-# 	plt.plot(x, model(pos1, width, height1, 0), '-', color='blue', alpha=0.3, label='data')
-
-print(a.get_best_fit())
-result = a.get_best_fit()['parameters']
-
+if __name__ == "__main__":
+    main(datafile=args.datafile, delta=args.delta, resume=args.resume, data_idx=args.idx, helicity=args.helicity, RR=args.ratio_range)
