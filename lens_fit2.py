@@ -67,11 +67,12 @@ for (MIN_DAY, MAX_DAY) in DAYS:
         Flux_err = Y.loc[(Y[' Frequency (GHz)'] == freq) & (Y[' MJD'] < MAX_DAY) & (Y[' MJD'] > MIN_DAY)][
             ' Fluxerr (Jy)']
         if args.detrend and Day.to_numpy().size > 0:
-            data_dict[freq] = (Day.to_numpy(), detrend(Flux.to_numpy(), bp=[np.argmin(abs(Day.to_numpy() - MIN_DAY)),
-                np.argmin(abs(Day.to_numpy() - MAX_DAY))]), Flux_err.to_numpy())
-            lower[freq] = data_dict[freq][1][np.argmax(Flux.to_numpy())] - np.max(Flux.to_numpy())
+            flux_detrend = detrend(Flux.to_numpy(), bp=[np.argmin(abs(Day.to_numpy() - MIN_DAY)),
+                np.argmin(abs(Day.to_numpy() - MAX_DAY))])
+            lower[freq] = flux_detrend[np.argmax(Flux.to_numpy())] - np.max(Flux.to_numpy())    
+            data_dict[freq] = (Day.to_numpy(), flux_detrend + abs(lower[freq]), Flux_err.to_numpy())
         else:
-            data_dict[freq] = (Day.to_numpy(), Flux.to_numpy(), Flux_err.to_numpy())
+            data_dict[freq] = (Day.to_numpy(), Flux.to_numpy() + 0.05, Flux_err.to_numpy())
             lower[freq] = -0.05
     Data.append(data_dict)
 
@@ -83,20 +84,20 @@ def QPsolver(data, prediction, lower, upper, K, G):
     b = np.matmul(w, Flux)
     if type(prediction) is tuple:
         n = 3
-        constraint_M = np.array([[((1-K)**2 - G**2)**(-1), ((1-K)**2 - G**2)**(-1), 1], [1, 0, 0], [0, 1, 0]])
+        constraint_M = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
         Ad = np.matmul(w, np.concatenate([np.array([[p1, p2, 1]]) for p1, p2 in np.array(prediction).T], axis=0))
-        l = np.hstack([b, lower, 1e-4, 1e-4])
-        u = np.hstack([b, upper, np.inf, np.inf])
+        l = np.hstack([b, 1e-7, 5e-5, 5e-5])
+        u = np.hstack([b, upper, upper, upper])
         Ad = sparse.csc_matrix(Ad)
         A = sparse.vstack([
         sparse.hstack([Ad, -sparse.eye(m)]),
         sparse.hstack([sparse.csc_matrix(constraint_M), sparse.csc_matrix((n, m))])], format='csc')
     else:
         n=2
-        constraint_M = np.array([[((1-K)**2 - G**2)**(-1), 1], [1, 0]])
+        constraint_M = np.array([[0, 1], [1, 0]])
         Ad = np.matmul(w, np.concatenate([np.array([[p, 1]]) for p in prediction], axis=0))
-        l = np.hstack([b, lower, 1e-4])
-        u = np.hstack([b, upper, np.inf])
+        l = np.hstack([b, 1e-7, 5e-5])
+        u = np.hstack([b, upper, upper])
         Ad = sparse.csc_matrix(Ad)
         A = sparse.vstack([
         sparse.hstack([Ad, -sparse.eye(m)]),
