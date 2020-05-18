@@ -15,8 +15,8 @@ ml py-numpy/1.17.2_py36
 #mpiexec -n 22 --oversubscribe python3 lens_fit2.py chains3_456 54880 55400 --day2 56650 57240 --day3 57970 58330 --freqs 15.0 --freqs 37.0
 #mpiexec -n 24 --oversubscribe python3 lens_fit2.py chains3_45_joint 54870 55330 --day2 56680 57190 --freqs 15.0
 #mpiexec -n 44 --oversubscribe python3 lens_fit2.py chains45_joint_detrend_open_negK 54870 57190 --day2 54870 57190 --freqs 15.0 --freqs 37.0 --detrend --fix toff
-#mpiexec -n 44 --oversubscribe python3 lens_fit2.py chains2_wide_final 48835 49850 --freqs 14.5 --freqs 22.0 #--day2 50800 52070 --freqs 14.5 --freqs 22.0 --detrend --fix toff
-mpiexec -n 44 --oversubscribe python3 lens_fit2.py chains1_wide_detrend_final 44800 45750 --freqs 8.0 --freqs 14.5 --detrend
+mpiexec -n 44 --oversubscribe python3 lens_fit2.py chains2_wide_final 48835 49850 --freqs 14.5 --freqs 22.0 #--day2 50800 52070 --freqs 14.5 --freqs 22.0 --detrend --fix toff
+#mpiexec -n 44 --oversubscribe python3 lens_fit2.py chains1_wide_detrend_final 44800 45750 --freqs 8.0 --freqs 14.5 --detrend
 #mpiexec -n 44 --oversubscribe python3 lens_fit2.py chains23_jointfull_wide_detrend 48835 52070 --day2 48835 52070 --freqs 14.5 --freqs 22.0 --detrend --fix toff
 #mpiexec -n 44 --oversubscribe python3 lens_fit2.py chains45_joint_detrend_open_final 54870 57190 --day2 54870 57190 --freqs 15.0 --freqs 37.0 --detrend --fix toff
 #python3 direct.py D_test 54870 57190 --day2 54870 57190 --freqs 15.0 --freqs 37.0 --detrend --method ip --fix K

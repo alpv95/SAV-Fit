@@ -130,8 +130,8 @@ def create_lens(Day, t_0=0.5, u_0=-0.2, t_E=1.0, s=1.0, q=0.01, alpha=270, K=0.0
 
 def prior(cube, ndim, nparams, active=[0,1,2,3,4,5,6,7,8,9,10,11,12,13]):
     # [t_0, u_0, t_E, s, q, alpha, K, G, t_02, u_02, t_E2, alpha2, t_03, u_03, t_E3, alpha3,]
-    multis = np.array([(DAYS[0][1] - DAYS[0][0]) / 2, 1.2, 1900, 0.6, 0.12, 140, 0.27, 0.3, 2*np.pi, (DAYS[1][1] - DAYS[1][0]) / 2, 1.2, 1900, 140, 200])[active]
-    adds = np.array([DAYS[0][0],                    -0.6, 1000, 0.7, 0.005, 200, -0.02, -0.15, 0.0, DAYS[1][0] + (DAYS[1][1] - DAYS[1][0]) / 2, -0.6, 1000, 200, -100])[active]
+    multis = np.array([(DAYS[0][1] - DAYS[0][0]) / 2, 1.2, 2000, 0.6, 0.12, 140, 0.27, 0.3, 2*np.pi, (DAYS[1][1] - DAYS[1][0]) / 2, 1.2, 2000, 140, 200])[active]
+    adds = np.array([DAYS[0][0],                    -0.6, 1300, 0.7, 0.005, 200, -0.02, -0.15, 0.0, DAYS[1][0] + (DAYS[1][1] - DAYS[1][0]) / 2, -0.6, 1300, 200, -100])[active]
 
     for i in range(ndim):
         cube[i] = cube[i] * multis[i] + adds[i]
