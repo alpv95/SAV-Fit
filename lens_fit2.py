@@ -7,12 +7,16 @@ import MulensModel as mu
 import corner
 import matplotlib.pyplot as plt
 import osqp
+import pickle
 import scipy as sp
 from scipy import sparse
+from scipy.signal import detrend
+import dynesty
 import contextlib
 import io
 import sys
 import argparse
+
 
 parser = argparse.ArgumentParser()
 # parser.add_argument('--ensemble', action='store_true',
@@ -28,11 +32,18 @@ parser.add_argument('--day3', nargs=2, type=int, default=(0,0),
 parser.add_argument('--freqs', action='append', default=None, type=float,
                     choices=[4.8, 8.0, 14.5, 15.0, 22.0, 37.0, 90.0, 230.0, 345.0],
                     help='List of frequency bands to consider')
-parser.add_argument('--resume', action='store_true', default=None, 
+parser.add_argument('--fix', type=str, action='append', default=[],
+                    choices=['K','G','s','q','toff','theta'],
+                    help='Parameters to fix')
+parser.add_argument('--detrend', action='store_true', 
+                    help='Whether to remove a linear trend from the lens data')
+parser.add_argument('--resume', action='store_true', 
                     help='Whether to resume from a different run')
+parser.add_argument("--dynesty", action='store_true',
+                    help="Whether to use dynesty dynamic nested sampling")
 args = parser.parse_args()
 
-
+print("ARGS", args.fix)
 @contextlib.contextmanager
 def nostdout():
     save_stdout = sys.stdout
@@ -47,6 +58,7 @@ print("Fitting SAVs between Days: {}\n for freqs: {}".format(DAYS, freqs))
 Y = pd.read_csv("/home/users/alpv95/khome/SAVRot/data/PKS1413_135_all.dat", delimiter=",")
 
 Data = []
+lower = {}
 for (MIN_DAY, MAX_DAY) in DAYS:
     data_dict = {}
     for freq in freqs:
@@ -54,10 +66,16 @@ for (MIN_DAY, MAX_DAY) in DAYS:
         Flux = Y.loc[(Y[' Frequency (GHz)'] == freq) & (Y[' MJD'] < MAX_DAY) & (Y[' MJD'] > MIN_DAY)][' Flux (Jy)']
         Flux_err = Y.loc[(Y[' Frequency (GHz)'] == freq) & (Y[' MJD'] < MAX_DAY) & (Y[' MJD'] > MIN_DAY)][
             ' Fluxerr (Jy)']
-        data_dict[freq] = (Day.to_numpy(), Flux.to_numpy(), Flux_err.to_numpy())
+        if args.detrend and Day.to_numpy().size > 0:
+            data_dict[freq] = (Day.to_numpy(), detrend(Flux.to_numpy(), bp=[np.argmin(abs(Day.to_numpy() - MIN_DAY)),
+                np.argmin(abs(Day.to_numpy() - MAX_DAY))]), Flux_err.to_numpy())
+            lower[freq] = data_dict[freq][1][np.argmax(Flux.to_numpy())] - np.max(Flux.to_numpy())
+        else:
+            data_dict[freq] = (Day.to_numpy(), Flux.to_numpy(), Flux_err.to_numpy())
+            lower[freq] = -0.05
     Data.append(data_dict)
 
-def QPsolver(data, prediction, lower, upper):
+def QPsolver(data, prediction, lower, upper, K, G):
     _, Flux, Flux_err = data
 
     m = len(Flux);  #dimensions
@@ -65,7 +83,7 @@ def QPsolver(data, prediction, lower, upper):
     b = np.matmul(w, Flux)
     if type(prediction) is tuple:
         n = 3
-        constraint_M = np.array([[1, 1, 1], [1, 0, 0], [0, 1, 0]])
+        constraint_M = np.array([[((1-K)**2 - G**2)**(-1), ((1-K)**2 - G**2)**(-1), 1], [1, 0, 0], [0, 1, 0]])
         Ad = np.matmul(w, np.concatenate([np.array([[p1, p2, 1]]) for p1, p2 in np.array(prediction).T], axis=0))
         l = np.hstack([b, lower, 1e-4, 1e-4])
         u = np.hstack([b, upper, np.inf, np.inf])
@@ -75,7 +93,7 @@ def QPsolver(data, prediction, lower, upper):
         sparse.hstack([sparse.csc_matrix(constraint_M), sparse.csc_matrix((n, m))])], format='csc')
     else:
         n=2
-        constraint_M = np.array([[1, 1], [1, 0]])
+        constraint_M = np.array([[((1-K)**2 - G**2)**(-1), 1], [1, 0]])
         Ad = np.matmul(w, np.concatenate([np.array([[p, 1]]) for p in prediction], axis=0))
         l = np.hstack([b, lower, 1e-4])
         u = np.hstack([b, upper, np.inf])
@@ -99,98 +117,74 @@ def QPsolver(data, prediction, lower, upper):
 
     return res.x[:3], res.info.obj_val #flux_scale and loss
 
-def create_lens(Day, t_0=0.5, u_0=-0.2, t_E=1.0, s=1.0, q=0.01, alpha=270, rho=0.021):
+def create_lens(Day, t_0=0.5, u_0=-0.2, t_E=1.0, s=1.0, q=0.01, alpha=270, K=0.0, G=0.0, theta=0.0):
     lens = mu.model.Model(
         {'t_0': t_0, 'u_0': u_0, 't_E': t_E, 's': s, 'q': q, 'alpha': alpha,
-         'rho': rho})
-    lens.set_magnification_methods([min(Day), 'VBBL', max(Day)])
+         'rho': 0.0, 'K': K, 'G': G*complex(np.cos(theta),np.sin(theta))})
+    lens.set_magnification_methods([min(Day), 'vbbl', max(Day)])
 
     return lens
 
-def prior1(cube, ndim, nparams):
-    # t_0=0.5,u_0=-0.18,t_E=0.5,s=1,q=0.1,alpha=270,rho=0.01
-    cube[0] = cube[0] * (DAYS[0][1] - DAYS[0][0]) + DAYS[0][0]
-    cube[1] = cube[1] * 1.0 - 0.5
-    cube[2] = cube[2] * (DAYS[0][1] - DAYS[0][0]) * 3 + (DAYS[0][1] - DAYS[0][0]) / 6
-    cube[3] = cube[3] * 0.8 + 0.6
-    cube[4] = cube[4] * 0.95 + 0.001
-    cube[5] = cube[5] * 360
-    cube[6] = 10 ** (cube[6] * 5 - 5)  # rho
+
+
+def prior(cube, ndim, nparams, active=[0,1,2,3,4,5,6,7,8,9,10,11,12,13]):
+    # [t_0, u_0, t_E, s, q, alpha, K, G, t_02, u_02, t_E2, alpha2, t_03, u_03, t_E3, alpha3,]
+    multis = np.array([(DAYS[0][1] - DAYS[0][0]) / 2, 1.2, 1900, 0.6, 0.12, 140, 0.27, 0.3, 2*np.pi, (DAYS[1][1] - DAYS[1][0]) / 2, 1.2, 1900, 140, 200])[active]
+    adds = np.array([DAYS[0][0],                    -0.6, 1000, 0.7, 0.005, 200, -0.02, -0.15, 0.0, DAYS[1][0] + (DAYS[1][1] - DAYS[1][0]) / 2, -0.6, 1000, 200, -100])[active]
+
+    for i in range(ndim):
+        cube[i] = cube[i] * multis[i] + adds[i]
 
     return cube
 
-def prior2(cube, ndim, nparams):
-    # t_0=0.5,u_0=-0.18,t_E=0.5,s=1,q=0.1,alpha=270,rho=0.01
-    cube[0] = cube[0] * (DAYS[0][1] - DAYS[0][0]) / 2 + DAYS[0][0]
-    cube[1] = cube[1] * 1.0 - 0.5
-    cube[2] = cube[2] * (DAYS[0][1] - DAYS[0][0]) * 0.45 + (DAYS[0][1] - DAYS[0][0]) / 6
-    cube[3] = cube[3] * 0.8 + 0.6
-    cube[4] = cube[4] * 0.95 + 0.001
-    cube[5] = cube[5] * 360
-    cube[6] = 10 ** (cube[6] * 5 - 5)  # rho
-    cube[7] = cube[7] * (DAYS[1][1] - DAYS[1][0]) / 2 + DAYS[1][0] + (DAYS[1][1] - DAYS[1][0]) * 0.85
-    cube[8] = cube[8] * 1.0 - 0.5
-    cube[9] = cube[9] * (DAYS[1][1] - DAYS[1][0]) * 0.4 + (DAYS[1][1] - DAYS[1][0]) * 0.4
-    cube[10] = cube[10] * 360
 
-    return cube
-
-def prior3(cube, ndim, nparams):
-    # t_0=0.5,u_0=-0.18,t_E=0.5,s=1,q=0.1,alpha=270,rho=0.01
-    cube[0] = cube[0] * (DAYS[0][1] - DAYS[0][0]) + DAYS[0][0]
-    cube[1] = cube[1] * 1.0 - 0.5
-    cube[2] = cube[2] * (DAYS[0][1] - DAYS[0][0]) * 3 + (DAYS[0][1] - DAYS[0][0]) / 6
-    cube[3] = cube[3] * 0.8 + 0.6
-    cube[4] = cube[4] * 0.95 + 0.001
-    cube[5] = cube[5] * 360
-    cube[6] = 10 ** (cube[6] * 5 - 5)  # rho
-    cube[7] = cube[7] * (DAYS[1][1] - DAYS[1][0]) + DAYS[1][0]
-    cube[8] = cube[8] * 1.0 - 0.5
-    cube[9] = cube[9] * (DAYS[1][1] - DAYS[1][0]) * 3 + (DAYS[1][1] - DAYS[1][0]) / 6
-    cube[10] = cube[10] * 360
-    cube[11] = cube[11] * (DAYS[2][1] - DAYS[2][0])*2  + DAYS[2][0] - (DAYS[2][1] - DAYS[2][0]) * 0.5
-    cube[12] = cube[12] * 1.0 - 0.5
-    cube[13] = (cube[13] * (DAYS[2][1] - DAYS[2][0]) * 3 + (DAYS[2][1] - DAYS[2][0]) / 6)*2
-    cube[14] = cube[14] * 360
-
-    return cube
-
-def loglike(cube, ndim, nparams):
-    if nparams <= 7:
-        t_0, u_0, t_E, s, q, alpha, rho = cube[0], cube[1], cube[2], cube[3], cube[4], cube[5], cube[6]
-    elif nparams > 7 and nparams < 13:
-        t_0, u_0, t_E, s, q, alpha, rho, t_02, u_02, t_E2, alpha2 = cube[0], cube[1], cube[2], cube[3], cube[4], cube[5], cube[6], cube[7], cube[8], cube[9], cube[10]
-    else:
-        t_0, u_0, t_E, s, q, alpha, rho, t_02, u_02, t_E2, alpha2, t_03, u_03, t_E3, alpha3 = cube[0], cube[1], cube[2], cube[3], cube[4], cube[5], cube[6], cube[7], cube[8], cube[9], cube[10], cube[11], cube[12], cube[13], cube[14]
+def loglike(cube, ndim, nparams, active=[0,1,2,3,4,5,6,7,8,9,10,11,12,13]):
+    parameters = np.zeros(17)    
+    parameters[active] = cube[:len(active)]
     loss = 0
-    for freq in freqs:
+    for f, freq in enumerate(freqs):
         Day1, _, _ = Data[0][freq]
         Day2, _, _ = Data[1][freq]
         Day3, _, _ = Data[2][freq]
         _, Flux, _ = Data[3][freq]
 
-        lower = np.min(Flux) - 0.5*np.std(Flux); upper = np.max(Flux) + 0.5*np.std(Flux)
+        upper = np.mean(Flux) - np.std(Flux); #lower = 0.0; 
         loss_flux1 = 0; loss_flux2 = 0; loss_flux3 = 0
 
-        if Day1.size:
-            lens1 = create_lens(Day1, t_0, u_0, t_E, s, q, alpha, rho)
-            #Testing full range fit
-            lens2 = create_lens(Day1, t_02, u_02, t_E2, s, q, alpha2, rho)
-            p_hat1 = lens1.magnification(Day1)
-            p_hat2 = lens2.magnification(Day1)
-            _, loss_flux1 = QPsolver(Data[0][freq], (p_hat1, p_hat2), lower, upper)
+        if f:
+            t_0 = parameters[0] + parameters[13]
+            t_02 = parameters[9] + parameters[13]
+        else:
+            t_0 = parameters[0]
+            t_02 = parameters[9]
 
-        # if Day2.size:
-        #     lens2 = create_lens(Day2, t_02, u_02, t_E2, s, q, alpha2, rho)
-        #     p_hat2 = lens2.magnification(Day2)
-        #     _, loss_flux2 = QPsolver(Data[1][freq], p_hat2, lower, upper)
+        if Day2.size:
+            if (Day1.size == Day2.size) and (Day1 == Day2).all():
+                Day = Day1
+                Data_current = Data[0][freq]
+            else:
+                Day = np.concatenate((Day1,Day2))
+                Data_concat = np.hstack((Data[0][freq], Data[1][freq]))
+                Data_current = (Data_concat[0],Data_concat[1],Data_concat[2])
+
+            lens1 = create_lens(Day, t_0, parameters[1], parameters[2], parameters[3], parameters[4], parameters[5], parameters[6], parameters[7], parameters[8])
+            lens2 = create_lens(Day, t_02, parameters[10], parameters[11], parameters[3], parameters[4], parameters[12], parameters[6], parameters[7], parameters[8])
+            p_hat1 = lens1.magnification(Day)
+            p_hat2 = lens2.magnification(Day)
+            _, loss_flux2 = QPsolver(Data_current, (p_hat1, p_hat2), lower[freq], upper, parameters[6], parameters[7])
+            #loss_flux2 = - 0.5*np.sum(np.log(Flux_err2**2)) - loss_flux2  
+
+        if Day1.size and not Day2.size:
+            lens1 = create_lens(Day1, parameters[0], parameters[1], parameters[2], parameters[3], parameters[4], parameters[5], parameters[6], parameters[7], parameters[8])
+            p_hat1 = lens1.magnification(Day1)
+            _, loss_flux1 = QPsolver(Data[0][freq], p_hat1, lower[freq], upper, parameters[6], parameters[7])
 
         if Day3.size:
-            lens3 = create_lens(Day3, t_03, u_03, t_E3, s, q, alpha3, rho)
+            lens3 = create_lens(Day3, parameters[13], parameters[14], parameters[15], parameters[3], parameters[4], parameters[16], parameters[6], parameters[7], parameters[8])
             p_hat3 = lens3.magnification(Day3)
-            _, loss_flux3 = QPsolver(Data[2][freq], p_hat3, lower, upper)
+            _, loss_flux3 = QPsolver(Data[2][freq], p_hat3, lower[freq], upper, parameters[6], parameters[7])
 
-        loss += - (loss_flux1 + loss_flux2 + loss_flux3)
+        loss += -(loss_flux1 + loss_flux2 + loss_flux3)
     return loss
 
 def main():
@@ -200,111 +194,130 @@ def main():
 
     ############# run MultiNest ###############
     if not DAYS[1][0]:
-        parameters = ["t_0", "u_0", "t_E", "s", "q", "alpha", "rho"]
-        n_params = len(parameters)
-        pymultinest.run(loglike, prior1, n_params, outputfiles_basename=datafile + '_1_', resume = args.resume, verbose = True,
-            const_efficiency_mode=True, n_live_points=1400, evidence_tolerance=0.5, sampling_efficiency=0.95, init_MPI=False)
+        parameters = ["t_0", "u_0", "t_E", "s", "q", "alpha", "K", "G", "theta"]
     elif not DAYS[2][0]:
-        parameters = ["t_0", "u_0", "t_E", "s", "q", "alpha", "rho", "t_02", "u_02", "t_E2", "alpha2"]
-        n_params = len(parameters)
-        pymultinest.run(loglike, prior2, n_params, outputfiles_basename=datafile + '_1_', resume = args.resume, verbose = True,
-            const_efficiency_mode=True, n_live_points=1400, evidence_tolerance=0.5, sampling_efficiency=0.95, init_MPI=False)
+        parameters = ["t_0", "u_0", "t_E", "s", "q", "alpha", "K", "G", "theta", "t_02", "u_02", "t_E2", "alpha2", "toff"]
     else:
-        parameters = ["t_0", "u_0", "t_E", "s", "q", "alpha", "rho", "t_02", "u_02", 
+        parameters = ["t_0", "u_0", "t_E", "s", "q", "alpha", "K", "G", "theta", "t_02", "u_02", 
             "t_E2", "alpha2", "t_03", "u_03", "t_E3", "alpha3"]
-        n_params = len(parameters)
-        pymultinest.run(loglike, prior3, n_params, outputfiles_basename=datafile + '_1_', resume = args.resume, verbose = True,
-            const_efficiency_mode=True, n_live_points=1800, evidence_tolerance=0.5, sampling_efficiency=0.97, init_MPI=False)
 
-    json.dump(parameters, open(datafile + '_1_params.json', 'w')) # save parameter names
+    active = [i for i in range(len(parameters))]
+    print("Fixing to 0.0: ", args.fix)
+    for r in args.fix:
+        active.remove(parameters.index(r))
+        parameters.remove(r)
+    n_params = len(parameters)
 
-    a = pymultinest.Analyzer(outputfiles_basename=datafile + '_1_', n_params = n_params)
-    print(a.get_best_fit())
+    if args.dynesty:
+        dsampler = dynesty.DynamicNestedSampler(lambda cube: loglike(cube,ndim=n_params,nparams=n_params, active=active), 
+                                                lambda cube: prior(cube,ndim=n_params,nparams=n_params,active=active),ndim=n_params, bound='multi', sample='unif')
+        dsampler.run_nested(dlogz_init=0.01, nlive_init=500, nlive_batch=500,
+                    wt_kwargs={'pfrac': 1.0}, stop_kwargs={'pfrac': 1.0})
+        dres_p = dsampler.results
+        print(dres_p.summary())
+        with open(args.datafile + '/dyndata.pkl', 'wb') as output:
+            print("Pickling results...")
+            pickle.dump(dres_p, output, -1)
+    else:
+        pymultinest.run(lambda cube,ndim,nparams: loglike(cube,ndim,nparams, active=active), lambda cube,ndim,nparams: prior(cube,ndim,nparams,active=active),
+            n_params, outputfiles_basename=datafile + '_1_', resume = args.resume, verbose = True, wrapped_params=[8],
+            const_efficiency_mode=True, n_live_points=1800, evidence_tolerance=0.5, sampling_efficiency=0.8, init_MPI=False)
 
-    '''---------------- Print Parameters and their associated errors ------------------ '''
-    s = a.get_stats()
-    print('  marginal likelihood:')
-    print('    ln Z = %.1f +- %.1f' % (s['global evidence'], s['global evidence error']))
-    print('  parameters:')
-    for p, m in zip(parameters, s['marginals']):
-        lo, hi = m['1sigma']
-        med = m['median']
-        sigma = (hi - lo) / 2
-        if sigma == 0:
-                i = 3
-        else:
-                i = max(0, int(-np.floor(np.log10(sigma))) + 1)
-        fmt = '%%.%df' % i
-        fmts = '\t'.join(['    %-15s' + fmt + " +- " + fmt])
-        print(fmts % (p, med, sigma))
+        json.dump(parameters, open(datafile + '_1_params.json', 'w')) # save parameter names
 
-    '''----------------  Corner Plot  ------------------ '''
-    print('creating marginal plot ...')
-    data = a.get_data()[:,2:]
-    weights = a.get_data()[:,0]
-    #mask = weights.cumsum() > 1e-5
-    for thresh in [1e-4,7e-5,4e-5,1e-5,1e-6]:
-        try:
-            mask = weights > thresh
-            corner.corner(data[mask,:], weights=weights[mask],
-                labels=parameters, show_titles=True, title_fmt=".2f",)
-            break
-        except:
-            continue
-    plt.savefig(datafile + 'CORNER22_37.pdf', format="pdf")
-    plt.close()
+        a = pymultinest.Analyzer(outputfiles_basename=datafile + '_1_', n_params = n_params)
+        print(a.get_best_fit())
 
-    '''----------------  Posterior Fit Plot  ------------------ '''
-    ### Define offsets for plotting purposes:
-    print('creating fit plot ...')
-    offsets = {4.8: 0, 8.0: 1.5, 14.5: 3, 15.0: 4.5,
-              22.0: 4.5, 37.0: 6.0, 230.0: 7.5, 345.0: 7.5,
-               90.0: 7,}
+        '''---------------- Print Parameters and their associated errors ------------------ '''
+        s = a.get_stats()
+        print('  marginal likelihood:')
+        print('    ln Z = %.1f +- %.1f' % (s['global evidence'], s['global evidence error']))
+        print('  parameters:')
+        for p, m in zip(parameters, s['marginals']):
+            lo, hi = m['1sigma']
+            med = m['median']
+            sigma = (hi - lo) / 2
+            if sigma == 0:
+                    i = 3
+            else:
+                    i = max(0, int(-np.floor(np.log10(sigma))) + 1)
+            fmt = '%%.%df' % i
+            fmts = '\t'.join(['    %-15s' + fmt + " +- " + fmt])
+            print(fmts % (p, med, sigma))
 
-    plt.figure(figsize=(20,12))
-    plt.ylim(ymin=0,ymax=12)
-    for i, freq in enumerate(freqs):
-        Day, Flux, Flux_err = Data[3][freq]
-        plt.errorbar(Day,Flux + offsets[freq],yerr=Flux_err,
-                     fmt='o', label="{} GHZ".format(freq))
-        lower = np.min(Flux) - 0.5*np.std(Flux); upper = np.max(Flux) + 0.5*np.std(Flux)
-        for (t_0, u_0, t_E, s, q, alpha, rho, t_02, u_02, t_E2, alpha2) in a.get_equal_weighted_posterior()[::1000, :-1]:
-            Day1, _, _ = Data[0][freq]
-            Day2, _, _ = Data[1][freq]
-            Day3, _, _ = Data[2][freq]
-            if Day1.size:
-                lens1 = create_lens(Day1, t_0, u_0, t_E, s, q, alpha, rho)
-                lens2 = create_lens(Day1, t_02, u_02, t_E2, s, q, alpha2, rho)
-                p_hat1 = lens1.magnification(Day1)
-                p_hat2 = lens2.magnification(Day1)
-                flux_scale1, _ = QPsolver(Data[0][freq], (p_hat1,p_hat2), lower, upper)
+        '''----------------  Corner Plot  ------------------ '''
+        print('creating marginal plot ...')
+        data = a.get_data()[:,2:]
+        weights = a.get_data()[:,0]
+        #mask = weights.cumsum() > 1e-5
+        for thresh in [1e-4,7e-5,4e-5,1e-5,1e-6]:
+            try:
+                mask = weights > thresh
+                corner.corner(data[mask,:], weights=weights[mask],
+                    labels=parameters, show_titles=True, title_fmt=".2f",)
+                break
+            except:
+                continue
+        plt.savefig(datafile + 'CORNER22_37.pdf', format="pdf")
+        plt.close()
 
-                lens1 = create_lens(Day, t_0, u_0, t_E, s, q, alpha, rho)
-                lens2 = create_lens(Day, t_02, u_02, t_E2, s, q, alpha2, rho)
-                p_hat_plot1 = lens1.magnification(Day)
-                p_hat_plot2 = lens2.magnification(Day)
-                plt.plot(Day, flux_scale1[0] * p_hat_plot1 + flux_scale1[1] * p_hat_plot2 + flux_scale1[2] 
-                        + offsets[freq], alpha=0.3, color='r')
+        # '''----------------  Posterior Fit Plot  ------------------ '''
+        # ### Define offsets for plotting purposes:
+        # print('creating fit plot ...')
+        # offsets = {4.8: 0, 8.0: 1.5, 14.5: 3, 15.0: 4.5,
+        #           22.0: 4.5, 37.0: 6.0, 230.0: 7.5, 345.0: 7.5,
+        #            90.0: 7,}
 
-            # if Day2.size:
-            #     lens2 = create_lens(Day2, t_02, u_02, t_E2, s, q, alpha2, rho)
-            #     p_hat2 = lens2.magnification(Day2)
-            #     flux_scale2, _ = QPsolver(Data[1][freq], p_hat2, lower, upper)
+        # plt.figure(figsize=(20,12))
+        # plt.ylim(ymin=0,ymax=12)
+        # for i, freq in enumerate(freqs):
+        #     Day, Flux, Flux_err = Data[3][freq]
+        #     plt.errorbar(Day,Flux + offsets[freq],yerr=Flux_err,
+        #                  fmt='o', label="{} GHZ".format(freq))
+        #     upper = np.mean(Flux) - np.std(Flux); #lower = 0.0; 
+        #     for (t_0, u_0, t_E, s, q, alpha, K, G, t_02, u_02, t_E2, alpha2) in a.get_equal_weighted_posterior()[::3000, :-1]:
+        #         Day1, _, _ = Data[0][freq]
+        #         Day2, _, _ = Data[1][freq]
+        #         Day3, _, _ = Data[2][freq]
 
-            #     lens2 = create_lens(Day, t_02, u_02, t_E2, s, q, alpha2, rho)
-            #     p_hat_plot = lens2.magnification(Day)
-            #     plt.plot(Day, flux_scale2[0] * p_hat_plot + flux_scale2[1] + offsets[freq], alpha=0.3, color='r')
+        #         if Day2.size:
+        #             if (Day1.size == Day2.size) and (Day1 == Day2).all():
+        #                 Day_current = Day1
+        #                 Data_current = Data[0][freq]
+        #             else:
+        #                 Day_current = np.concatenate((Day1,Day2))
+        #                 Data_concat = np.hstack((Data[0][freq], Data[1][freq]))
+        #                 Data_current = (Data_concat[0],Data_concat[1],Data_concat[2])
 
-            if Day3.size:
-                lens3 = create_lens(Day3, t_03, u_03, t_E3, s, q, alpha3, rho)
-                p_hat3 = lens3.magnification(Day3)
-                flux_scale3, _ = QPsolver(Data[2][freq], p_hat3, lower, upper)
+        #             lens1 = create_lens(Day_current, t_0, u_0, t_E, s, q, alpha, K, G)
+        #             lens2 = create_lens(Day_current, t_02, u_02, t_E2, s, q, alpha2, K, G)
+        #             p_hat1 = lens1.magnification(Day_current)
+        #             p_hat2 = lens2.magnification(Day_current)
+        #             flux_scale1, _ = QPsolver(Data_current, (p_hat1, p_hat2), lower[freq], upper, K, G)
 
-                lens3 = create_lens(Day, t_03, u_03, t_E3, s, q, alpha3, rho)
-                p_hat_plot = lens3.magnification(Day)
-                plt.plot(Day, flux_scale3[0] * p_hat_plot + flux_scale3[1] + offsets[freq], alpha=0.3, color='r')
-    plt.legend()
-    plt.savefig(datafile + 'FIT22_37.pdf', format="pdf")
+        #             plt.plot(Day_current, flux_scale1[0] * p_hat1 + flux_scale1[1] * p_hat2 + flux_scale1[2] 
+        #                     + offsets[freq], alpha=0.3, color='r')
+
+        #         if Day1.size and not Day2.size:
+        #             lens1 = create_lens(Day1, t_0, u_0, t_E, s, q, alpha, K, G)
+        #             p_hat1 = lens1.magnification(Day1)
+        #             flux_scale1, _ = QPsolver(Data[0][freq], p_hat1, lower[freq], upper, K, G)
+
+        #             lens1 = create_lens(Day, t_0, u_0, t_E, s, q, alpha, K, G)
+        #             p_hat_plot1 = lens1.magnification(Day)
+        #             plt.plot(Day, flux_scale1[0] * p_hat_plot1 + flux_scale1[1] 
+        #                     + offsets[freq], alpha=0.3, color='r')
+
+        #         # if Day3.size:
+        #         #     lens3 = create_lens(Day3, t_03, u_03, t_E3, s, q, alpha3, rho)
+        #         #     p_hat3 = lens3.magnification(Day3)
+        #         #     flux_scale3, _ = QPsolver(Data[2][freq], p_hat3, lower, upper)
+
+        #         #     lens3 = create_lens(Day, t_03, u_03, t_E3, s, q, alpha3, rho)
+        #         #     p_hat_plot = lens3.magnification(Day)
+        #         #     plt.plot(Day, flux_scale3[0] * p_hat_plot + flux_scale3[1] + offsets[freq], alpha=0.3, color='r')
+        # plt.legend()
+        # plt.savefig(datafile + 'FIT.pdf', format="pdf")
 
 if __name__ == "__main__":
     main()
