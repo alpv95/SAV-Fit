@@ -19,5 +19,5 @@ TYPE=1
 LENGTH=short
 SMOOTH=0.05
 
-mpiexec -n $SLURM_NTASKS python3 lens_fit2.py All-$SAV1-$SAV2-$SAV4-$SAV5-$TYPE-$SMOOTH-$LENGTH-dt-loweff $SAV1 $SAV2 $SAV4 $SAV5 --efficiency 0.12 --live 2000 --const --smooth $SMOOTH --type $TYPE --length $LENGTH --detrend
+mpiexec -n $SLURM_NTASKS python3 lens_fit.py All-$SAV1-$SAV2-$SAV4-$SAV5-$TYPE-$SMOOTH-$LENGTH-dt-loweff $SAV1 $SAV2 $SAV4 $SAV5 --efficiency 0.12 --live 2000 --const --smooth $SMOOTH --type $TYPE --length $LENGTH --detrend
 
