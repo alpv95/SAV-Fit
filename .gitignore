@@ -3,3 +3,4 @@ chains*/*
 slurm*
 current*
 simulated_lightcurves*/*
+.vscode/*
