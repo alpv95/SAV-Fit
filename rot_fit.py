@@ -21,6 +21,7 @@ import osqp
 import scipy as sp
 from scipy import sparse
 import argparse
+import copy
 
 parser = argparse.ArgumentParser()
 # parser.add_argument('--ensemble', action='store_true',
@@ -46,7 +47,7 @@ def nostdout():
     yield
     sys.stdout = save_stdout
 
-def QPsolver(data, prediction, lower, upper, bound_vals):
+def QPsolver(data, prediction):
     Flux, Flux_err = data
 
     m = len(Flux); n = 2 #dimensions
@@ -54,22 +55,22 @@ def QPsolver(data, prediction, lower, upper, bound_vals):
     Ad = np.matmul(w, np.concatenate([np.array([[p, 1]]) for p in prediction], axis=0))
     Ad = sparse.csc_matrix(Ad)
     b = np.matmul(w, Flux)
-    constraint_M = np.array([[bound_vals[0], 1],[bound_vals[1], 1], [1, 0], [0, 1]]) #constrain_M * x < u etc.
+    constraint_M = np.array([[1,0],[0,1]]) #constrain_M * x < u etc.
 
     # OSQP data
     P = sparse.block_diag([sparse.csc_matrix((n, n)), sparse.eye(m)], format='csc')
     Q = np.zeros(n + m)
     A = sparse.vstack([
         sparse.hstack([Ad, -sparse.eye(m)]),
-        sparse.hstack([sparse.csc_matrix(constraint_M), sparse.csc_matrix((n+2, m))])], format='csc')
-    l = np.hstack([b, lower, lower, 1e-8, -bound_vals[2]])
-    u = np.hstack([b, upper, upper, np.inf, bound_vals[2]])
+        sparse.hstack([sparse.csc_matrix(constraint_M), sparse.csc_matrix((n, m))])], format='csc')
+    l = np.hstack([b, 1e-6, 1e-6, ])
+    u = np.hstack([b, np.inf, np.inf, ])
 
     with nostdout():
         # Create an OSQP object
         prob = osqp.OSQP()
         # Setup workspace
-        prob.setup(P, Q, A, l, u, eps_rel=0.0001,polish=1)
+        prob.setup(P, Q, A, l, u, eps_rel=1e-4,polish=1)
         # Solve problem
         res = prob.solve()
 
@@ -79,8 +80,8 @@ def Rot(phi):
     return np.array([[math.cos(phi),0,math.sin(phi)],[0,1,0],[-math.sin(phi),0,math.cos(phi)]])
 def RotX(phi): 
     return np.array([[1,0,0],[0,math.cos(phi),-math.sin(phi)],[0,math.sin(phi),math.cos(phi)]])
-def Bhelix(phase, slope, sign):
-    h = np.array([sign * np.cos(phase), np.sin(phase), np.ones_like(phase) * slope])
+def Bhelix(phase, slope, sign, global_sign=1):
+    h = global_sign * np.array([sign * np.cos(phase), np.sin(phase), np.ones_like(phase) * slope])
     return h / np.linalg.norm(h,axis=0)
 def flux_weight(angle, alpha):
     """Takes angle of B-field to our line of sight and returns the relative weighted flux"""
@@ -88,16 +89,21 @@ def flux_weight(angle, alpha):
 def get_perp(vector2d):
     return np.array(vector2d[1],-vector2d[0])
 
+def points_on_circumference(center=(0, 0), r=50, n=100):
+    return [
+        (
+            center[0]+(math.cos(2 * pi / n * x) * r),  # x
+            center[1] + (math.sin(2 * pi / n * x) * r)  # y
+        ) for x in range(0, n )]
+
 D = lambda Gamma, theta: 1 / (Gamma * (1 - np.sqrt(1-1/Gamma**2)*np.cos(np.deg2rad(theta))))
 Dapprox = lambda Gamma, ratio: 2 * Gamma / (1 + ratio**2)
 
 def pcircle(R, a, N ):
     """Generate N coordinates on a circle of radius a at r=R,phi=0"""
-    theta = np.linspace(-np.arctan2(a,R),np.arctan2(a,R), int(N/2))
-    r_pos = R*np.cos(theta) + np.sqrt(a**2 - R**2 * np.sin(theta)**2)
-    r_min = R*np.cos(theta) - np.sqrt(a**2 - R**2 * np.sin(theta)**2)
-    r = np.concatenate([r_pos,r_min])
-    th = np.concatenate([theta,theta])
+    circle = np.array(points_on_circumference(center=(R, 0), r=a, n=N))
+    r = np.sqrt(circle[:,0]**2 + circle[:,1]**2)
+    th = np.arctan2(circle[:,1],circle[:,0])
     return np.array([r,th])
 
 def rotate(th, B, axis): #about arbitrary axis
@@ -110,7 +116,7 @@ def rotate(th, B, axis): #about arbitrary axis
     + (-axis[:,:,1]*B[:,:,0] + axis[:,:,0]*B[:,:,1]) * np.sin(th)
     return np.stack([B1,B2,B3],axis=2)
 
-def Jet(day, ratio, ratio_range, pitch, offset, deg, axis=0, sign=1, alpha=2, Gamma=10):
+def Jet(day, ratio, ratio_range, pitch, offset, deg, axis=0, sign=-1, alpha=2, Gamma=10, global_sign=1):
     """Helical jet of jets
     
     Args:
@@ -134,12 +140,13 @@ def Jet(day, ratio, ratio_range, pitch, offset, deg, axis=0, sign=1, alpha=2, Ga
         raise ValueError("Jet opening angle can't be greater than 1/Gamma in Lab frame")
         
     day = day - np.min(day)
-    B_orig = Bhelix((day*deg + offset) * np.pi/180, pitch, sign)
+    B_orig = Bhelix((day*deg + offset) * np.pi/180, pitch, sign, global_sign)
     #Build jet of jets in multiple circles:
-    coords = np.concatenate([pcircle(ratio, ratio_range, 30),pcircle(ratio, 5*ratio_range/6, 24), 
-                             pcircle(ratio, 4*ratio_range/6, 18), pcircle(ratio, 3*ratio_range/6, 12),
-                             pcircle(ratio, 2*ratio_range/6, 6), pcircle(ratio, 1*ratio_range/6, 2)],axis=1)
-    #coords = np.expand_dims(np.array([ratio,0]),axis=1)
+    coords = np.concatenate([pcircle(ratio, ratio_range, 36),pcircle(ratio, 5*ratio_range/6, 30), 
+                             pcircle(ratio, 4*ratio_range/6, 24), pcircle(ratio, 3*ratio_range/6, 18),
+                             pcircle(ratio, 2*ratio_range/6, 12), pcircle(ratio, 1*ratio_range/6, 6),
+                         pcircle(ratio, 0*ratio_range/6, 1)],axis=1)
+    
     theta_rot = np.arccos((1 - coords[0,:]**2) / (1 + coords[0,:]**2))
     x0,y0 = np.meshgrid(np.transpose(B_orig)[:,0],np.stack([-np.sin(coords[1,:]),np.cos(coords[1,:]),np.zeros(len(coords[1,:]))],axis=1)[:,0])
     x1,y1 = np.meshgrid(np.transpose(B_orig)[:,1],np.stack([-np.sin(coords[1,:]),np.cos(coords[1,:]),np.zeros(len(coords[1,:]))],axis=1)[:,1])
@@ -150,10 +157,12 @@ def Jet(day, ratio, ratio_range, pitch, offset, deg, axis=0, sign=1, alpha=2, Ga
     
     B = rotate(th, B_mesh, axis_mesh)
     #B shape = (coords,days,3)
-    Btheta = np.arctan2(np.sqrt(np.sum(B[:,:,:2]**2,axis=2)), B[:,:,2])
-    weights = (Dapprox(Gamma,coords[0,:])**4 * flux_weight(Btheta, alpha).T).T #broadcast
     
-    vec = B[:,:,:2][:,:,::-1]
+    Btheta = np.arctan2(np.sqrt(np.sum(B[:,:,:2]**2,axis=2)), B[:,:,2])
+    weights = (D(Gamma,coords[0,:]/Gamma)**4 * flux_weight(Btheta, alpha).T).T #broadcast
+    weights = weights / np.max(weights)
+    
+    vec = copy.copy(B[:,:,:2][:,:,::-1])
     vec[:,:,1] *= -1
     PA = np.arctan2(vec[:,:,1],vec[:,:,0])
     S1 = np.sum(weights * np.cos(2 * PA),axis=0)
@@ -161,7 +170,7 @@ def Jet(day, ratio, ratio_range, pitch, offset, deg, axis=0, sign=1, alpha=2, Ga
     Pi = np.sqrt((0.7*S1)**2 + (0.7*S2)**2) / np.sum(weights,axis=0)
     PA = np.rad2deg(np.arctan2(S2,S1) / 2 ) + axis
     P = np.sum(weights, axis=0)
-    
+
     return Pi, PA, P
 
 def main(datafile, delta, resume, data_idx, helicity, RR):
@@ -204,7 +213,7 @@ def main(datafile, delta, resume, data_idx, helicity, RR):
                 #ratio range just between 0 - 1
                 cube[1] *= RR
                 cube[2] = cube[2]*8 - 4 #pitch
-                cube[3] = cube[3]*360 - 180 #offset
+                cube[3] = cube[3]*720 - 360 #offset
                 cube[4] = cube[4] * (-deg*0.8 + deg*1.2) + deg*0.8 #deg
                 return cube
             
@@ -218,21 +227,16 @@ def main(datafile, delta, resume, data_idx, helicity, RR):
                 
                 w = np.ndarray.flatten(np.array([(err*2*np.sin(2*np.deg2rad(pa)),err*2*np.cos(2*np.deg2rad(pa))) for pa, err in zip(PA,PA_err)]))
                 w = np.diag(1 / w) #weighted least squares
-                _, loss_pa, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))        
-                #_, loss_flux = QPsolver((Flux, Flux_err), p_hat, 0, np.inf, bound_vals=(np.max(p_hat),np.min(p_hat),np.inf) )
-                A = np.concatenate([np.array([[p,1]]) for p in p_hat],axis=0)
-                w = np.diag(1 / Flux_err)
-                b = Flux
-                _, loss_flux, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
+                _, loss_pa, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b)) 
 
-                #A = np.concatenate([np.array([[pi,1]]) for pi in pi_hat],axis=0)
-                A = np.array([pi_hat])
+                _, loss_flux = QPsolver((Flux, Flux_err), p_hat,)
+
+                A = np.array([pi_hat]).T
                 w = np.diag(1 / Pi_err)
                 b = Pi
                 _, loss_pi, _, _ = np.linalg.lstsq(np.matmul(w,A),np.matmul(w,b))
-                #_, loss_pi = QPsolver((Pi, Pi_err), pi_hat, 0, 0.72, bound_vals=(np.max(pi_hat),np.min(pi_hat),0.05) )
                         
-                return -(delta[0] * loss_pa[0] + delta[1] * loss_flux + delta[2] * loss_pi)
+                return -(delta[0] * loss_pa[0] + delta[1] * loss_flux + delta[2] * loss_pi[0])
         
 
             # number of dimensions our problem has
@@ -242,16 +246,16 @@ def main(datafile, delta, resume, data_idx, helicity, RR):
             
             # run MultiNest
             pymultinest.run(loglike, prior, n_params, outputfiles_basename=datafile + '_1_'+ str(helicity) + blazar.replace(".dat",""), resume = resume, verbose = True, 
-                            const_efficiency_mode=True, n_live_points=1800, evidence_tolerance=0.5, sampling_efficiency=0.97,)
+                            const_efficiency_mode=True, n_live_points=1800, evidence_tolerance=0.5, sampling_efficiency=0.8,)
             json.dump(parameters, open(datafile + '_1_params.json', 'w')) # save parameter names
             
             a = pymultinest.Analyzer(outputfiles_basename=datafile + '_1_'+ str(helicity) + blazar.replace(".dat",""), n_params = n_params)
             print(a.get_best_fit())
             helicity_result[j] = a.get_best_fit()['log_likelihood']
 
-        if helicity_result[0] > helicity_result[1]:
-            helicity = 1
-            a = pymultinest.Analyzer(outputfiles_basename=datafile + '_1_'+ str(helicity) + blazar.replace(".dat",""), n_params = n_params)
+        # if helicity_result[0] > helicity_result[1]:
+        #     helicity = 1
+        #     a = pymultinest.Analyzer(outputfiles_basename=datafile + '_1_'+ str(helicity) + blazar.replace(".dat",""), n_params = n_params)
             
         '''---------------- Print Parameters and their associated errors ------------------ '''
         s = a.get_stats()
